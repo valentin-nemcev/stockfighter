@@ -60,8 +60,9 @@
   (sf-gm-request :get (path "instances" instanceId)))
 
 
-(defn -main
-  "I don't do a whole lot ... yet."
+
+(defn level1
+  "Level 1: 'First steps'"
   [& args]
   (ensure-api-up!)
   (let [{:keys [account instanceId], [venue] :venues, [stock] :tickers}
@@ -70,12 +71,13 @@
         get-ask-price #(:ask (sf-request :get (path stock-path "quote")))
         buy (fn [qty price] (sf-request :post (path stock-path "orders")
                                         {:account account
-                                         :orderType :immediate-or-cancel
+                                         :orderType :limit
                                          :direction :buy
                                          :qty qty
                                          :price price
                                          }))]
     (println account venue stock)
     (pprint (level-status instanceId))
-    (pprint (get-ask-price))
-    (pprint (buy 1 10000))))
+    (println "Ask price" (get-ask-price))
+    (pprint (buy 100 10000))
+    (pprint (level-status instanceId))))
