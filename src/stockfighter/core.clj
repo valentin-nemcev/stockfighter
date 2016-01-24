@@ -81,3 +81,42 @@
     (println "Ask price" (get-ask-price))
     (pprint (buy 100 10000))
     (pprint (level-status instanceId))))
+
+
+
+(defn level2
+  "Level 2: 'Chock a block'"
+  [& args]
+  (ensure-api-up!)
+  (let [{:keys [account instanceId], [venue] :venues, [stock] :tickers}
+          (start-level "chock_a_block")
+        target-qty 100000
+        stock-path (path "venues" venue "stocks" stock)
+        get-quote #(sf-request :get (path stock-path "quote"))
+        buy (fn [qty price] (sf-request :post (path stock-path "orders")
+                                        {:account account
+                                         :orderType :immediate-or-cancel
+                                         :direction :buy
+                                         :qty qty
+                                         :price price
+                                         }))
+        extract-target-price
+        (fn [flash]
+          (when-let [price-str
+                     (second (re-find #"target price is \$(\d+\.\d+)"
+                                      (get flash :info "")))]
+            (int (* 100 (Float/parseFloat price-str)))))]
+
+    (loop [target-price 100000]
+      (let [{:keys [flash state] :as status} (level-status instanceId)
+            target-price (or (extract-target-price flash) target-price)]
+        (when flash (println target-price flash))
+        (if (= state "open")
+          (do
+            (let [{:keys [ask askSize]} (get-quote)]
+              (println ask askSize)
+              (if (and (> askSize 0) (<= ask target-price))
+                (pprint (buy askSize ask))))
+            (Thread/sleep 1000)
+            (recur target-price))
+          (pprint status))))))
