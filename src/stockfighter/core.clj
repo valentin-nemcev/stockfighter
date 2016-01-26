@@ -2,7 +2,10 @@
   (:gen-class)
   (:require [clojure.pprint :refer [pprint]]
             [carica.core :refer [config configurer resources]]
-            [clj-http.client :as client])
+            [clj-http.client :as client]
+            [cheshire.core :as json]
+            [http.async.client :as http]
+            [clojure.core.async :as async])
   )
 
 (def secrets-config (configurer (resources "secrets-config.edn")))
@@ -120,3 +123,55 @@
             (Thread/sleep 1000)
             (recur target-price))
           (pprint status))))))
+
+
+
+(defn println-t
+  [& args]
+  (apply println (str "t" (.getId (Thread/currentThread)) ":") args))
+
+
+(defn ws-connect
+  [client path ws-control ws-msg]
+  (http/websocket
+    client
+    path
+    :open  (fn [ws]
+             (async/put! ws-control [:connected]))
+    :close (fn [ws code reason]
+             (async/put! ws-control [:disconnected code reason]))
+    :error (fn [ws e] (println "ERROR:" e))
+    :text  (fn [ws msg]
+             (async/put! ws-msg (json/parse-string msg true))
+             )))
+
+(defn ws-async
+  [path]
+    (let [ws-control (async/chan)
+          ws-msg (async/chan)
+          client (http/create-client)]
+      (async/go-loop
+        [state [:started]]
+        (let [[state & details] (or state (async/<! ws-control))]
+          (apply println-t "Socket state:" (name state) details)
+          (case state
+            (:started :disconnected)
+            (do
+              (ws-connect client path ws-control ws-msg)
+              (recur [:connecting path]))
+
+            (recur nil))))
+      ws-msg))
+
+(defn level2-async
+  "Level 2: 'Chock a block' using async"
+  [& args]
+  (ensure-api-up!)
+  (let [{:keys [account instanceId], [venue] :venues, [stock] :tickers}
+          (start-level "chock_a_block")
+        target-qty 100000
+        stock-path (path "wss://api.stockfighter.io/ob/api"
+                         "ws" account "venues" venue "tickertape"
+                         "stocks" stock)
+        tape (ws-async stock-path)]
+    (async/<!! (async/go-loop [] (pprint (async/<! tape)) (recur)))))
