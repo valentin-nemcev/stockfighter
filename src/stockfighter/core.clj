@@ -1,6 +1,7 @@
 (ns stockfighter.core
   (:gen-class)
-  (:require [clojure.pprint :refer [pprint]]
+  (:require [clojure.string :as string]
+            [clojure.pprint :refer [pprint]]
             [carica.core :refer [config configurer resources]]
             [clj-http.client :as client]
             [cheshire.core :as json]
@@ -16,7 +17,7 @@
 (defn path
   "Helper for building paths, similar to str"
   [& parts]
-  (clojure.string/join "/" parts))
+  (string/join "/" parts))
 
 
 (defn sf-request-url
@@ -130,6 +131,11 @@
   [& args]
   (apply println (str "t" (.getId (Thread/currentThread)) ":") args))
 
+(defn fprice
+  [price]
+  (if price
+    (format "$%03d.%02d" (quot price 100) (rem price 100))
+    "$---.--"))
 
 (defn ws-connect
   [client path ws-control ws-msg]
@@ -146,10 +152,9 @@
              )))
 
 (defn ws-async
-  [path]
+  [client path]
     (let [ws-control (async/chan)
-          ws-msg (async/chan)
-          client (http/create-client)]
+          ws-msg (async/chan)]
       (async/go-loop
         [state [:started]]
         (let [[state & details] (or state (async/<! ws-control))]
@@ -163,15 +168,147 @@
             (recur nil))))
       ws-msg))
 
+
+(defn debounce
+  [chan delay-msec]
+  (let [debounced (async/chan)]
+    (async/go-loop
+      [state :wait
+       values []
+       chan-with-timeout [chan]]
+      (let [[chan timeout] chan-with-timeout
+            [value chan-or-timeout] (async/alts! chan-with-timeout)]
+        (condp = chan-or-timeout
+          chan    (case state
+                    :wait     (recur :debounce
+                                     (conj values value)
+                                     [chan (async/timeout delay-msec)])
+                    :debounce (recur :debounce
+                                     (conj values value)
+                                     [chan (async/timeout delay-msec)]))
+          timeout (do (async/>! debounced values)
+                      (recur :wait [] [chan])))))
+    debounced))
+
+(defn tape-async
+  [client account venue stock]
+  (let [stock-path (path "wss://api.stockfighter.io/ob/api"
+                         "ws" account "venues" venue "tickertape"
+                         "stocks" stock)
+        ws (ws-async client stock-path)]
+  (debounce (async/map :quote [ws]) 50)))
+
+(defn level-status-async
+  [instanceId]
+  (let [status (async/chan)]
+    (async/go-loop
+      []
+      (async/>! status (level-status instanceId))
+      (async/<! (async/timeout 1000))
+      (recur))
+    (async/unique status)))
+
+
+(defn fps [price size] (str (fprice price) "×" (format "%05d" size)))
+(defn fquote
+  [{:keys [bid bidSize ask askSize last lastSize]}]
+    (str
+      "Bid: "  (fps bid bidSize) " "
+      "Last: " (fps last lastSize) " "
+      "Ask: "  (fps ask askSize)))
+
+(defn fstatus
+  [{:keys [state details flash]}]
+  (str "Level " state
+       ", day " (format "%d/%d"
+                        (:tradingDay details) (:endOfTheWorldDay details))
+       (string/join ""
+                    (map (fn [[key msg]]
+                           (str "\n" (string/capitalize (name key)) ": " msg))
+                         flash))))
+
+
+(defn print-quotes
+  [quotes]
+  (when-let [skipped (butlast quotes)]
+    (println (format "Skipped %03d" (count skipped))))
+  (println (fquote (last quotes))))
+
+(defn printer-async
+  [tape level-status]
+  (async/go-loop
+    []
+    (async/alt!
+      tape         ([quotes] (print-quotes quotes))
+      level-status ([status] (println (fstatus status))))
+    (recur)))
+
+
+(defn extract-target-price
+  [flash]
+  (when-let [price-str
+             (second (re-find #"target price is \$(\d+\.\d+)"
+                              (get flash :info "")))]
+    (int (* 100 (Float/parseFloat price-str)))))
+
+(defn buy-stock-async
+  [client [account venue stock] qty price]
+  (let [stock-path (path "https://api.stockfighter.io/ob/api"
+                         "venues" venue "stocks" stock "orders")
+        headers {"X-Starfighter-Authorization" api-key}
+        body (json/generate-string {:account account
+                                    :venue venue
+                                    :stock stock
+                                    :price price
+                                    :qty qty
+                                    :direction :buy
+                                    :orderType :immediate-or-cancel})]
+    (async/thread (json/parse-string (http/string
+                                       (http/POST client
+                                                  stock-path
+                                                  :body body
+                                                  :headers headers))))))
+
+(defn trader-async
+  [client venue-stock tape level-status]
+  (async/go-loop
+    [state :wait-for-target-price
+     target-price nil]
+    (println state target-price)
+    (case state
+      :wait-for-target-price
+      (if-let [target-price (-> (async/<! level-status)
+                                (get :flash {})
+                                extract-target-price)]
+        (recur :buy target-price)
+        (recur :get-target-price nil))
+
+      :get-target-price
+      (let [last-price (-> (async/<! tape) last :last)]
+        (pprint (async/<! (buy-stock-async client venue-stock 100 last-price)))
+        (recur :wait-for-target-price nil))
+
+      :buy
+      (let [{ask :ask ask-size :askSize} (last (async/<! tape))]
+        (println "buy" ask ask-size)
+        (when (and (> ask-size 0) (< ask target-price))
+          (pprint (async/<! (buy-stock-async client venue-stock ask-size ask))))
+        (recur :buy target-price)
+      ))))
+
+
 (defn level2-async
   "Level 2: 'Chock a block' using async"
   [& args]
-  (ensure-api-up!)
-  (let [{:keys [account instanceId], [venue] :venues, [stock] :tickers}
-          (start-level "chock_a_block")
-        target-qty 100000
-        stock-path (path "wss://api.stockfighter.io/ob/api"
-                         "ws" account "venues" venue "tickertape"
-                         "stocks" stock)
-        tape (ws-async stock-path)]
-    (async/<!! (async/go-loop [] (pprint (async/<! tape)) (recur)))))
+  (with-open [client (http/create-client)]
+    (ensure-api-up!)
+    (let [{:keys [account instanceId], [venue] :venues, [stock] :tickers}
+            (start-level "chock_a_block")
+          target-qty 100000
+          tape (async/mult (tape-async client account venue stock))
+          level-status (async/mult (level-status-async instanceId))
+          trader (trader-async client [account venue stock]
+                              (async/tap tape (async/chan))
+                              (async/tap level-status (async/chan)))]
+      (async/<!! (printer-async (async/tap tape (async/chan))
+                                (async/tap level-status (async/chan)))))))
