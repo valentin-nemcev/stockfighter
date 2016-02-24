@@ -3,9 +3,9 @@
   (:require [clojure.string :as string]
             [clojure.pprint :refer [pprint]]
             [carica.core :refer [config configurer resources]]
-            [clj-http.client :as client]
             [cheshire.core :as json]
             [http.async.client :as http]
+            [http.async.client.request :as http.request]
             [clojure.core.async :as async])
   )
 
@@ -19,111 +19,52 @@
   [& parts]
   (string/join "/" parts))
 
-
 (defn sf-request-url
   "Wrap clj-http requirest with stockfighter specific params and headers"
-  [method url & [req-body req]]
-  (:body (client/request
-              (merge req {:method method
-                          :url url
-                          :as :json
-                          :headers {"X-Starfighter-Authorization" api-key}
-                          :form-params req-body
-                          :content-type :json
-                          }))))
+  [client method url & [req-body req]]
+
+  (let [headers {"X-Starfighter-Authorization" api-key}
+        body (json/generate-string req-body)
+        final-req (merge req {:body body :headers headers})
+        resp (http.request/execute-request client (apply http.request/prepare-request
+                                                 method
+                                                 url
+                                                 (apply concat final-req)))
+        resp-str (http/string (http/await resp))]
+    (json/parse-string resp-str true)))
+
 
 (defn sf-request
   "Wrap sf-request-url with stockfighter game api url"
-  [method path & [req-body]]
-  (sf-request-url method (str "https://api.stockfighter.io/ob/api/" path) req-body))
+  [client method path & [req-body]]
+  (sf-request-url client method (str "https://api.stockfighter.io/ob/api/" path) req-body))
 
 (defn sf-gm-request
   "Wrap sf-request-url with stockfighter gm api url"
-  [method path & [req-body]]
-  (sf-request-url method (str "https://api.stockfighter.io/gm/" path) req-body))
+  [client method path & [req-body]]
+  (sf-request-url client method (str "https://api.stockfighter.io/gm/" path) req-body))
 
 
 (defn ensure-api-up!
   "Check heartbeat api endpoint and throw exception if it's down"
-  []
-  (let [{:keys [ok error]} (sf-request :get "heartbeat")]
+  [client]
+  (pprint (sf-request client :get "heartbeat"))
+  (let [{:keys [ok error]} (sf-request client :get "heartbeat")]
     (when-not ok (throw (Exception. (str "Api down: " error))))))
 
 (defn get-levels
-  []
-  (sf-gm-request :get "levels"))
+  [client]
+  (sf-gm-request client :get "levels"))
 
 
 (defn start-level
-  [name]
+  [client name]
   "Start level with a given name unless it was already started"
-  (sf-gm-request :post (path "levels" name)))
+  (sf-gm-request client  :post (path "levels" name)))
 
 (defn level-status
-  [instanceId]
-  (sf-gm-request :get (path "instances" instanceId)))
-
-
-
-(defn level1
-  "Level 1: 'First steps'"
-  [& args]
-  (ensure-api-up!)
-  (let [{:keys [account instanceId], [venue] :venues, [stock] :tickers}
-          (start-level "first_steps")
-        stock-path (path "venues" venue "stocks" stock)
-        get-ask-price #(:ask (sf-request :get (path stock-path "quote")))
-        buy (fn [qty price] (sf-request :post (path stock-path "orders")
-                                        {:account account
-                                         :orderType :limit
-                                         :direction :buy
-                                         :qty qty
-                                         :price price
-                                         }))]
-    (println account venue stock)
-    (pprint (level-status instanceId))
-    (println "Ask price" (get-ask-price))
-    (pprint (buy 100 10000))
-    (pprint (level-status instanceId))))
-
-
-
-(defn level2
-  "Level 2: 'Chock a block'"
-  [& args]
-  (ensure-api-up!)
-  (let [{:keys [account instanceId], [venue] :venues, [stock] :tickers}
-          (start-level "chock_a_block")
-        target-qty 100000
-        stock-path (path "venues" venue "stocks" stock)
-        get-quote #(sf-request :get (path stock-path "quote"))
-        buy (fn [qty price] (sf-request :post (path stock-path "orders")
-                                        {:account account
-                                         :orderType :immediate-or-cancel
-                                         :direction :buy
-                                         :qty qty
-                                         :price price
-                                         }))
-        extract-target-price
-        (fn [flash]
-          (when-let [price-str
-                     (second (re-find #"target price is \$(\d+\.\d+)"
-                                      (get flash :info "")))]
-            (int (* 100 (Float/parseFloat price-str)))))]
-
-    (loop [target-price 100000]
-      (let [{:keys [flash state] :as status} (level-status instanceId)
-            target-price (or (extract-target-price flash) target-price)]
-        (when flash (println target-price flash))
-        (if (= state "open")
-          (do
-            (let [{:keys [ask askSize]} (get-quote)]
-              (println ask askSize)
-              (if (and (> askSize 0) (<= ask target-price))
-                (pprint (buy askSize ask))))
-            (Thread/sleep 1000)
-            (recur target-price))
-          (pprint status))))))
+  [client instanceId]
+  (sf-gm-request client :get (path "instances" instanceId)))
 
 
 
@@ -199,11 +140,11 @@
   (debounce (async/map :quote [ws]) 50)))
 
 (defn level-status-async
-  [instanceId]
+  [client instanceId]
   (let [status (async/chan)]
     (async/go-loop
       []
-      (async/>! status (level-status instanceId))
+      (async/>! status (level-status client instanceId))
       (async/<! (async/timeout 1000))
       (recur))
     (async/unique status)))
@@ -301,12 +242,12 @@
   "Level 2: 'Chock a block' using async"
   [& args]
   (with-open [client (http/create-client)]
-    (ensure-api-up!)
+    (ensure-api-up! client)
     (let [{:keys [account instanceId], [venue] :venues, [stock] :tickers}
-            (start-level "chock_a_block")
+            (start-level client "chock_a_block")
           target-qty 100000
           tape (async/mult (tape-async client account venue stock))
-          level-status (async/mult (level-status-async instanceId))
+          level-status (async/mult (level-status-async client instanceId))
           trader (trader-async client [account venue stock]
                               (async/tap tape (async/chan))
                               (async/tap level-status (async/chan)))]
