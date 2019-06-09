@@ -48,7 +48,6 @@
 (defn ensure-api-up!
   "Check heartbeat api endpoint and throw exception if it's down"
   [client]
-  (pprint (sf-request client :get "heartbeat"))
   (let [{:keys [ok error]} (sf-request client :get "heartbeat")]
     (when-not ok (throw (Exception. (str "Api down: " error))))))
 
@@ -57,15 +56,23 @@
   (sf-gm-request client :get "levels"))
 
 
-(defn start-level
-  [client name]
-  "Start level with a given name unless it was already started"
-  (sf-gm-request client  :post (path "levels" name)))
-
 (defn level-status
   [client instanceId]
   (sf-gm-request client :get (path "instances" instanceId)))
 
+(defn start-level
+  [client name]
+  "Start level with a given name, restarts it if it was already running"
+  (println (str "Starting level " name "..."))
+  (let [{:keys [account instanceId], [venue] :venues, [stock] :tickers :as resp}
+        (sf-gm-request client :post (path "levels" name))
+        status (level-status client instanceId)
+        day (get-in status [:details :tradingDay] 0)]
+    (if (> day 0)
+      (do (println (str "Level already running at day " day ", stopping..."))
+          (sf-gm-request client :post (path "instances" instanceId "stop"))
+          (start-level client name))
+      {:account account :instanceId instanceId :venue venue :stock stock})))
 
 
 (defn println-t
@@ -93,13 +100,14 @@
              )))
 
 (defn ws-async
-  [client path]
+  [socket-name client path]
     (let [ws-control (async/chan)
           ws-msg (async/chan)]
       (async/go-loop
         [state [:started]]
         (let [[state & details] (or state (async/<! ws-control))]
-          (apply println-t "Socket state:" (name state) details)
+          (println socket-name "socket" (name state)
+                          (string/join " " details))
           (case state
             (:started :disconnected)
             (do
@@ -136,7 +144,7 @@
   (let [stock-path (path "wss://api.stockfighter.io/ob/api"
                          "ws" account "venues" venue "tickertape"
                          "stocks" stock)
-        ws (ws-async client stock-path)]
+        ws (ws-async "Tape" client stock-path)]
   (debounce (async/map :quote [ws]) 50)))
 
 (defn level-status-async
@@ -176,12 +184,15 @@
   (println (fquote (last quotes))))
 
 (defn printer-async
-  [tape level-status]
+  [tape level-status trader-status]
   (async/go-loop
     []
     (async/alt!
       tape         ([quotes] (print-quotes quotes))
-      level-status ([status] (println (fstatus status))))
+      level-status ([status] (println (fstatus status)))
+      trader-status (
+                     [[state & details]]
+                     (println (name state) (string/join " " details))))
     (recur)))
 
 
@@ -211,31 +222,39 @@
                                                   :headers headers))))))
 
 (defn trader-async
-  [client venue-stock tape level-status]
-  (async/go-loop
-    [state :wait-for-target-price
-     target-price nil]
-    (println state target-price)
-    (case state
-      :wait-for-target-price
-      (if-let [target-price (-> (async/<! level-status)
-                                (get :flash {})
-                                extract-target-price)]
-        (recur :buy target-price)
-        (recur :get-target-price nil))
+  [client venue-stock tape order-updates level-status]
+  (let [status (async/chan)]
+    (async/go-loop
+      [state :wait-for-target-price
+      target-price nil]
+      (async/>! status [state target-price])
+      (case state
+        :wait-for-target-price
+        (if-let [target-price (-> (async/<! level-status)
+                                  (get :flash {})
+                                  extract-target-price)]
+          (recur :buy target-price)
+          (recur :get-target-price nil))
 
-      :get-target-price
-      (let [last-price (-> (async/<! tape) last :last)]
-        (pprint (async/<! (buy-stock-async client venue-stock 100 last-price)))
-        (recur :wait-for-target-price nil))
+        :get-target-price
+        (let [last-price (-> (async/<! tape) last :last)]
+          (order-updates (async/<! (buy-stock-async
+                              client
+                              venue-stock
+                              100
+                              last-price)))
+          (recur :wait-for-target-price nil))
 
-      :buy
-      (let [{ask :ask ask-size :askSize} (last (async/<! tape))]
-        (println "buy" ask ask-size)
-        (when (and (> ask-size 0) (< ask target-price))
-          (pprint (async/<! (buy-stock-async client venue-stock ask-size ask))))
-        (recur :buy target-price)
-      ))))
+        :buy
+        (let [{ask :ask ask-size :askSize} (last (async/<! tape))]
+          (when (and (> ask-size 0) (< ask target-price))
+            (pprint (async/<! (buy-stock-async client
+                                               venue-stock
+                                               ask-size
+                                               ask))))
+          (recur :buy target-price)
+        )))
+    (async/unique status)))
 
 
 (defn level2-async
@@ -243,13 +262,14 @@
   [& args]
   (with-open [client (http/create-client)]
     (ensure-api-up! client)
-    (let [{:keys [account instanceId], [venue] :venues, [stock] :tickers}
+    (let [{:keys [account instanceId venue stock]}
             (start-level client "chock_a_block")
           target-qty 100000
           tape (async/mult (tape-async client account venue stock))
           level-status (async/mult (level-status-async client instanceId))
-          trader (trader-async client [account venue stock]
+          trader-status (async/mult (trader-async client [account venue stock]
                               (async/tap tape (async/chan))
-                              (async/tap level-status (async/chan)))]
+                              (async/tap level-status (async/chan (async/sliding-buffer 1)))))]
       (async/<!! (printer-async (async/tap tape (async/chan))
-                                (async/tap level-status (async/chan)))))))
+                                (async/tap level-status (async/chan))
+                                (async/tap trader-status (async/chan)))))))

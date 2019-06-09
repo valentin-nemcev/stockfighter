@@ -7,6 +7,7 @@
                  [clj-http "2.0.1"]
                  [cheshire "5.5.0"]
                  [http.async.client "1.0.1"]
+                 [org.slf4j/slf4j-nop "1.7.18"]
                  [org.clojure/core.async "0.2.374"]
                  [sonian/carica "1.2.1"]]
   :main ^:skip-aot stockfighter.core
